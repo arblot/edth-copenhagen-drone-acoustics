@@ -40,4 +40,3 @@ The clips are annotated with the filenames themselves, e.g. DRONE_001.wav, HELIC
 The audio in the dataset is taken from the videos or recorded separately.  
 The background sound class contains general background sounds recorded outdoor in the acquisition location and
 includes some clips of the sounds from the servos moving the pan/tilt platform where the sensors were mounted._
-
