@@ -18,18 +18,18 @@ def plot_waveform(waveform: AudioWaveform, axis: Axes) -> None:
     num_samples: int = waveform.data.shape[0]
     time_axis = torch.linspace(0, num_samples / waveform.sample_rate, steps=num_samples)
     axis.plot(time_axis, waveform.data, linewidth=0.1)
-    axis.set_xlabel("Time")
+    axis.set_xlabel("Time (s)")
     axis.set_ylabel("Amplitude")
     axis.set_xlim(float(time_axis[0]), float(time_axis[-1]))
 
 
 def plot_spectrogram(waveform: AudioWaveform, axis: Axes) -> None:
     resample = T.Resample(waveform.sample_rate, 16_000)
-    waveform_to_spectrogram = T.MelSpectrogram(
-        sample_rate=waveform.sample_rate, n_mels=128, win_length=2048, n_fft=2048, hop_length=1024
-    )
+    waveform_to_spectrogram = T.Spectrogram(win_length=4096, n_fft=4096, hop_length=2048)
     db_transform = T.AmplitudeToDB(stype="power", top_db=80)
     spectrogram = db_transform(waveform_to_spectrogram(resample(waveform.data)))
-    axis.imshow(spectrogram, aspect="auto", origin="lower")
-    axis.set_xlabel("Time Bins")
-    axis.set_ylabel("Frequency")
+    axis.imshow(
+        spectrogram, aspect="auto", origin="lower", extent=(0, waveform.duration, 0, waveform.sample_rate / 2000)
+    )
+    axis.set_xlabel("Time (s)")
+    axis.set_ylabel("Frequency (kHz)")
