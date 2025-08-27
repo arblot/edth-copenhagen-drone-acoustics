@@ -10,14 +10,35 @@ used for drone detection, each has limitations such as weather and obstructions.
 Given the low infrastructure costs and ability for rapid deployment, acoustic sensing presents a suitable additional
 layer of surveillance for modern defense strategies.
 
-The problem is split into two phases.
+The problem is split into three phases.
 
-Phase 1: 3-class prediction. We provide a small curated dataset of open-source acoustic recordings split into three
-categories: background, drone, and helicopter. The challenge is to train a model to separate these three class from
-their acoustic signatures.
+### Phase 1: Model Training
 
-# TODO(jearly): Document phase 2
-Phase 2:
+We provide a small curated dataset of open-source acoustic recordings split into three categories: background,
+drone, and helicopter. The challenge is to train a model to separate these three class from their acoustic signatures.
+
+The train and validation datasets are available at
+[https://github.com/helsing-ai/edth-copenhagen-drone-acoustics/releases/download/train_val_data/drone_acoustics_train_val_data.zip](https://github.com/helsing-ai/edth-copenhagen-drone-acoustics/releases/download/train_val_data/drone_acoustics_train_val_data.zip).  
+Download this data into `data/raw`. See the Data section below for more details.
+
+To get started, work through `intro_notebook.ipynb`.
+
+### Phase 2: Competition
+
+Given that you have trained your model in Phase 1, the next step is to compete against other teams at the hackathon!
+
+Go to [http://172.104.137.51:8080/login](http://172.104.137.51:8080/login) to sign up and get instructions on how to
+compete.
+
+### Phase 3: Do something awesome!
+
+Now that you've validated your approach by competing against other teams, it's up to you to chose how to extend
+this work for the rest of the hackathon!  
+
+If you're looking for inspiration, you could try:
+- running your model on an edge device or phone
+- using a real microphone and detecting drones in the real world
+- using explainability to explore **how** your model identifies drones
 
 ## Data
 
@@ -28,15 +49,6 @@ Paper: [A dataset for multi-sensor drone detection](https://www.sciencedirect.co
 
 While the GitHub provides both audio and video, we are only interested in the audio data.  
 The challenge is to perform three-class classification (background/drone/helicopter) purely from audio.  
-Audio is captured from a Boya BY-MM1 mini cardioid directional microphone.  
-The provided audio in two channel L/R format, which has been automatically processed from a mono microphone.  
-For each 2-channel 10-second file, we convert this into single channel (left or right) non-overlapping 5 second clips.  
-This means each individual original file becomes four distinct files in our dataset.
-
-From the paper:  
-_The audio part has 90 ten-second files in wav-format with a sampling frequency of 44100 Hz.  
-There are 30 files of each of the three output audio classes [background, drone, helicopter].  
-The clips are annotated with the filenames themselves, e.g. DRONE_001.wav, HELICOPTER_001.wav, BACKGROUND_001.wav, etc.  
-The audio in the dataset is taken from the videos or recorded separately.  
+Audio is captured from a Boya BY-MM1 mini cardioid directional microphone with a sampling frequency of 44100 Hz.  
 The background sound class contains general background sounds recorded outdoor in the acquisition location and
-includes some clips of the sounds from the servos moving the pan/tilt platform where the sensors were mounted._
+includes some clips of the sounds from the servos moving the pan/tilt platform where the sensors were mounted.
