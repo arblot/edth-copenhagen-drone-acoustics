@@ -17,11 +17,7 @@ The problem is split into three phases.
 We provide a small curated dataset of open-source acoustic recordings split into three categories: background,
 drone, and helicopter. The challenge is to train a model to separate these three class from their acoustic signatures.
 
-The train and validation datasets are available at
-[https://github.com/helsing-ai/edth-copenhagen-drone-acoustics/releases/download/train_val_data/drone_acoustics_train_val_data.zip](https://github.com/helsing-ai/edth-copenhagen-drone-acoustics/releases/download/train_val_data/drone_acoustics_train_val_data.zip).  
-Download this data into `data/raw`. See the Data section below for more details.
-
-To get started, work through `intro_notebook.ipynb`.
+See "Getting Started" below to begin!
 
 ### Phase 2: Competition
 
@@ -40,6 +36,27 @@ If you're looking for inspiration, you could try:
 - using a real microphone and detecting drones in the real world
 - using explainability to explore **how** your model identifies drones
 
+## Getting started
+
+To get setup, first clone this repo:
+```bash
+git clone git@github.com:helsing-ai/edth-copenhagen-drone-acoustics.git
+```
+
+This project uses [uv](https://docs.astral.sh/uv/) to manage dependencies; follow the
+[uv installation guide](https://docs.astral.sh/uv/getting-started/installation/) if you don't already have it installed.
+Then create the virtual environment with:
+```bash
+uv sync
+```
+
+Next, you need to download the train and validation datasets.
+These are available [here](https://github.com/helsing-ai/edth-copenhagen-drone-acoustics/releases/download/train_val_data/drone_acoustics_train_val_data.zip).  
+Extract and copy the `train` and `val` directories into `data/raw` so you have `data/raw/train/` and `data/raw/val/`.  
+See "Data" below for more details on the dataset used in this work.
+
+You're all ready to go. Work through `intro_notebook.ipynb` for an acoustics machine learning starter guide!
+
 ## Data
 
 Sourced from: https://github.com/DroneDetectionThesis/Drone-detection-dataset (audio + video dataset)  
@@ -49,6 +66,7 @@ Paper: [A dataset for multi-sensor drone detection](https://www.sciencedirect.co
 
 While the GitHub provides both audio and video, we are only interested in the audio data.  
 The challenge is to perform three-class classification (background/drone/helicopter) purely from audio.  
-Audio is captured from a Boya BY-MM1 mini cardioid directional microphone with a sampling frequency of 44100 Hz.  
+Audio is captured from a Boya BY-MM1 mini cardioid directional microphone with a sampling frequency of 44100 Hz.
+We have then applied crop, pitch, volume, and white noise augmentations to the original data to give you more variety.
 The background sound class contains general background sounds recorded outdoor in the acquisition location and
 includes some clips of the sounds from the servos moving the pan/tilt platform where the sensors were mounted.
