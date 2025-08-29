@@ -14,6 +14,35 @@ from hs_hackathon_drone_acoustics.base import AudioWaveform
 logger: Final = logging.getLogger(__name__)
 
 
+def convert_to_spectrogram(waveform: AudioWaveform, n_fft: int = 2048, hop_length: int = 512) -> NDArray[np.float64]:
+    """Convert audio waveform to spectrogram (magnitude spectrum over time)."""
+    stft = librosa.stft(waveform.data.numpy(), n_fft=n_fft, hop_length=hop_length)
+    spectrogram = np.abs(stft)
+    return spectrogram
+
+
+def convert_to_mel_spectrogram(waveform: AudioWaveform, n_mels: int = 128, n_fft: int = 2048, hop_length: int = 512) -> NDArray[np.float64]:
+    """Convert audio waveform to mel-scaled spectrogram."""
+    mel_spec = librosa.feature.melspectrogram(
+        y=waveform.data.numpy(), 
+        sr=waveform.sample_rate, 
+        n_mels=n_mels, 
+        n_fft=n_fft, 
+        hop_length=hop_length
+    )
+    return mel_spec
+
+
+def convert_to_spectrum(waveform: AudioWaveform) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Convert audio waveform to frequency spectrum (single snapshot)."""
+    fft = np.fft.fft(waveform.data.numpy())
+    magnitude = np.abs(fft)
+    frequencies = np.fft.fftfreq(len(fft), 1/waveform.sample_rate)
+    # Return only positive frequencies
+    n_positive = len(frequencies) // 2
+    return frequencies[:n_positive], magnitude[:n_positive]
+
+
 class FeatureExtractor(ABC):
     @abstractmethod
     def extract(self, waveform: AudioWaveform) -> NDArray[np.float64]: ...
