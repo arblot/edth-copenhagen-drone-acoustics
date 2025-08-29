@@ -51,7 +51,9 @@ uv sync
 ```
 
 Next, you need to download the train and validation datasets.
-These are available [here](https://github.com/helsing-ai/edth-copenhagen-drone-acoustics/releases/download/train_val_data/drone_acoustics_train_val_data.zip).  
+
+> [Train and Validation dataset download](https://github.com/helsing-ai/edth-copenhagen-drone-acoustics/releases/download/train_val_data/drone_acoustics_train_val_data.zip).  
+
 Extract and copy the `train` and `val` directories into `data/raw` so you have `data/raw/train/` and `data/raw/val/`.  
 See "Data" below for more details on the dataset used in this work.
 
@@ -59,7 +61,10 @@ You're all ready to go. Work through `intro_notebook.ipynb` for an acoustics mac
 
 ## Data
 
-Sourced from: https://github.com/DroneDetectionThesis/Drone-detection-dataset (audio + video dataset)  
+> [Train and Validation dataset download](https://github.com/helsing-ai/edth-copenhagen-drone-acoustics/releases/download/train_val_data/drone_acoustics_train_val_data.zip).  
+
+See "Getting Started" above for instructions on where to place this data.  
+Originally sourced from: https://github.com/DroneDetectionThesis/Drone-detection-dataset (audio + video dataset)  
 Paper: [A dataset for multi-sensor drone detection](https://www.sciencedirect.com/science/article/pii/S2352340921007976#!)
 
 ### Audio Dataset Details
