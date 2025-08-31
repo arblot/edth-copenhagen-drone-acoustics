@@ -5,15 +5,24 @@ Train a fusion classifier for 3-class audio using:
 - Tabular MLP branch (engineered features + MFCC stats)
 - Split-aware data loading (pre-existing split or auto 70/15/15)
 - (Optional) SpecAugment on mel (TRAIN ONLY, CNN branch only)
-- Label smoothing, seeded loaders, and early stopping
+- Waveform time-shift (TRAIN ONLY), label smoothing, EMA, AMP
+- Early stopping, gradient clipping, balanced sampler (optional)
+- Separate TTA for val vs test
 
-Example:
-  python -u -m hs_hackathon_drone_acoustics.train_fusion ^
-    --data_root "C:\\Users\\strik\\Downloads\\drone_acoustics_train_val_data" ^
-    --epochs 20 --batch_size 8 --specaugment ^
-    --sa_time_width 20 --sa_time_masks 1 --sa_freq_width 8 --sa_freq_masks 1 ^
-    --sa_p 0.7 --label_smoothing 0.05
+Usage (example):
+  python -m hs_hackathon_drone_acoustics.train_fusion ^
+    --data_root "C:\\Users\\you\\drone_acoustics_train_val_data" ^
+    --epochs 20 --batch_size 8 ^
+    --lr 5e-4 --ft_lr_mult 0.1 ^
+    --label_smoothing 0.0 ^
+    --specaugment --sa_time_width 20 --sa_time_masks 1 --sa_freq_width 8 --sa_freq_masks 1 ^
+    --sa_p 0.4 --ft_disable_sa ^
+    --shift_prob 0.3 --shift_max_sec 0.2 ^
+    --n_mels 128 --dropout 0.3 ^
+    --tta_val 1 --tta_test 5 ^
+    --out .\\fusion_seed0.pt --seed 0
 """
+
 from __future__ import annotations
 
 import argparse
@@ -22,6 +31,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
+from copy import deepcopy
 
 import numpy as np
 import torch
@@ -29,11 +39,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.model_selection import StratifiedShuffleSplit
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import models
 import librosa
 
-# ---- Project package (import from your repo) ----
+# ---- Project package ----
 from hs_hackathon_drone_acoustics import CLASSES
 from hs_hackathon_drone_acoustics.base import AudioWaveform
 
@@ -58,13 +68,12 @@ def seed_worker(worker_id):
 
 @dataclass
 class SpecConfig:
-    sr: int = 16000           # resample target for consistency
+    sr: int = 16000
     n_fft: int = 1024
     hop: int = 256
     n_mels: int = 128
     fmin: int = 20
     fmax: int | None = None   # None -> sr/2
-
 
 def logmel_dbfs(y: np.ndarray, cfg: SpecConfig) -> np.ndarray:
     """
@@ -77,7 +86,6 @@ def logmel_dbfs(y: np.ndarray, cfg: SpecConfig) -> np.ndarray:
     )
     M_db = librosa.power_to_db(M, ref=1.0)  # absolute dBFS
     return M_db.astype(np.float32)
-
 
 def mfcc_stats_from_logmel_db(M_db: np.ndarray, n_mfcc: int = 20) -> np.ndarray:
     """
@@ -96,7 +104,6 @@ def mfcc_stats_from_logmel_db(M_db: np.ndarray, n_mfcc: int = 20) -> np.ndarray:
 
     vec = np.concatenate([stats(mfcc), stats(d1), stats(d2)], axis=0)
     return vec.astype(np.float32)
-
 
 def engineered_features(y: np.ndarray, sr: int, frame_len: int = 2048, hop: int = 512) -> np.ndarray:
     """
@@ -121,47 +128,39 @@ def engineered_features(y: np.ndarray, sr: int, frame_len: int = 2048, hop: int 
 
     rms_db = 20 * np.log10(rms)
     feats = [
-        # RMS stats (dBFS)
         rms_db.mean(), rms_db.std(),
         np.percentile(rms_db, 10), np.percentile(rms_db, 50), np.percentile(rms_db, 90),
-        # Peaks & dynamics
         20 * np.log10(peak), crest, dyn_range,
-        # Spectral aggregates
         *agg(cent), *agg(bw), *agg(roll), *agg(flat), *agg(flux),
-        # Temporal
         librosa.feature.zero_crossing_rate(y).mean().astype(np.float32),
     ]
     return np.asarray(feats, dtype=np.float32)
 
 
-# ----------------- SpecAugment -----------------
+# ----------------- SpecAugment (mel) -----------------
 
 def specaugment(mel_db: np.ndarray,
                 time_w: int = 30, time_m: int = 2,
                 freq_w: int = 12, freq_m: int = 2) -> np.ndarray:
     """
     Simple SpecAugment on log-mel **in dBFS** (train only, CNN branch only).
-    Masked regions filled with the 1st percentile dB value (gentle) to preserve absolute loudness semantics.
+    Masked regions filled with the 1st percentile dB value (gentle).
     """
     M = mel_db.copy()
     F, T = M.shape
-    fill = float(np.percentile(M, 1))  # softer than absolute min
+    fill = float(np.percentile(M, 1))
 
-    # Frequency masks
     for _ in range(max(0, freq_m)):
         w = np.random.randint(0, min(freq_w, F) + 1)
-        if w == 0: 
-            continue
-        f0 = np.random.randint(0, F - w + 1)
-        M[f0:f0 + w, :] = fill
+        if w:
+            f0 = np.random.randint(0, F - w + 1)
+            M[f0:f0 + w, :] = fill
 
-    # Time masks
     for _ in range(max(0, time_m)):
         w = np.random.randint(0, min(time_w, T) + 1)
-        if w == 0:
-            continue
-        t0 = np.random.randint(0, T - w + 1)
-        M[:, t0:t0 + w] = fill
+        if w:
+            t0 = np.random.randint(0, T - w + 1)
+            M[:, t0:t0 + w] = fill
 
     return M
 
@@ -174,7 +173,11 @@ class FusionDataset(Dataset):
                  specaugment: bool = False,
                  sa_time_w: int = 30, sa_time_m: int = 2,
                  sa_freq_w: int = 12, sa_freq_m: int = 2,
-                 sa_p: float = 1.0):
+                 sa_p: float = 1.0,
+                 # waveform time-shift (enable on TRAIN datasets)
+                 enable_shift: bool = False,
+                 shift_prob: float = 0.5,
+                 shift_max_sec: float = 0.25):
         self.filepaths = filepaths
         self.labels = labels
         self.cfg = cfg
@@ -186,6 +189,11 @@ class FusionDataset(Dataset):
         self.sa_freq_w, self.sa_freq_m = sa_freq_w, sa_freq_m
         self.sa_p = float(sa_p)
 
+        # Waveform time shift (train datasets)
+        self.enable_shift = bool(enable_shift)
+        self.shift_prob = float(shift_prob)
+        self.shift_max_sec = float(shift_max_sec)
+
     def __len__(self) -> int:
         return len(self.filepaths)
 
@@ -196,7 +204,6 @@ class FusionDataset(Dataset):
 
         # Mono
         if y.ndim > 1:
-            # (T, C) or (C, T) -> average channels; be robust:
             if y.shape[0] < y.shape[-1]:
                 y = np.mean(y, axis=1).astype(np.float32)
             else:
@@ -208,6 +215,18 @@ class FusionDataset(Dataset):
             sr = self.cfg.sr
         else:
             sr = sr_in
+
+        # Optional time shift (train datasets only)
+        if self.enable_shift and (np.random.rand() < self.shift_prob):
+            max_shift = int(self.shift_max_sec * sr)
+            if max_shift > 0:
+                k = np.random.randint(-max_shift, max_shift + 1)
+                if k != 0:
+                    y = np.roll(y, k)
+                    if k > 0:
+                        y[:k] = 0.0
+                    else:
+                        y[k:] = 0.0
 
         # Center crop/pad to fixed seconds
         if self.time_crop is not None and self.time_crop > 0:
@@ -226,9 +245,8 @@ class FusionDataset(Dataset):
         label = self.labels[idx]
         y, sr = self._load_and_preprocess(path)
 
-        # Base mel (clean, absolute dBFS)
-        M_base = logmel_dbfs(y, SpecConfig(sr=self.cfg.sr, n_fft=self.cfg.n_fft, hop=self.cfg.hop,
-                                           n_mels=self.cfg.n_mels, fmin=self.cfg.fmin, fmax=self.cfg.fmax))
+        # Base mel (clean)
+        M_base = logmel_dbfs(y, self.cfg)
 
         # CNN mel (maybe augmented)
         M_cnn = M_base
@@ -295,7 +313,8 @@ class TabularMLP(nn.Module):
 
 
 class FusionModel(nn.Module):
-    def __init__(self, tab_dim: int, num_classes: int = 3, img_dim: int = 256, tab_emb: int = 64, p: float = 0.2, pretrained: bool = True):
+    def __init__(self, tab_dim: int, num_classes: int = 3,
+                 img_dim: int = 256, tab_emb: int = 64, p: float = 0.2, pretrained: bool = True):
         super().__init__()
         self.img = SpecCNN(out_dim=img_dim, pretrained=pretrained)
         self.tab = TabularMLP(in_dim=tab_dim, out_dim=tab_emb, hidden=256, p=p)
@@ -313,40 +332,109 @@ class FusionModel(nn.Module):
         return self.head(z)
 
 
-# ----------------- Train / Eval Loops -----------------
+# ----------------- EMA wrapper -----------------
 
-def train_one_epoch(model, loader, opt, device, label_smoothing=0.0):
+class ModelEMA:
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.ema = deepcopy(model).eval()
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+        self.decay = decay
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        d = self.decay
+        msd, esd = model.state_dict(), self.ema.state_dict()
+        for k in esd.keys():
+            m = msd[k]
+            e = esd[k]
+            if torch.is_floating_point(e):
+                e.mul_(d).add_(m, alpha=1.0 - d)
+            else:
+                e.copy_(m)
+
+
+# ----------------- Helpers -----------------
+
+def _set_bn_eval(m):
+    if isinstance(m, (nn.BatchNorm2d, nn.SyncBatchNorm)):
+        m.eval()
+
+
+# ----------------- Train / Eval -----------------
+
+def train_one_epoch(model, loader, opt, device, label_smoothing=0.0,
+                    ema: ModelEMA | None = None,
+                    scaler: torch.amp.GradScaler | None = None,
+                    grad_clip: float | None = 5.0,
+                    freeze_backbone_bn: bool = False):
     model.train()
+    if freeze_backbone_bn:
+        # Keep BN layers of the CNN backbone in eval() even while training
+        model.img.backbone.apply(_set_bn_eval)
+
     total, correct, loss_sum = 0, 0, 0.0
     for mel, tab, y in loader:
-        mel, tab, y = mel.to(device), tab.to(device), y.to(device)
+        mel, tab, y = mel.to(device, non_blocking=True), tab.to(device, non_blocking=True), y.to(device, non_blocking=True)
         opt.zero_grad(set_to_none=True)
-        logits = model(mel, tab)
-        loss = F.cross_entropy(logits, y, label_smoothing=label_smoothing)
-        loss.backward()
-        opt.step()
+        with torch.amp.autocast('cuda', enabled=(scaler is not None)):
+            logits = model(mel, tab)
+            loss = F.cross_entropy(logits, y, label_smoothing=label_smoothing)
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            if grad_clip is not None:
+                scaler.unscale_(opt)
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(opt)
+            scaler.update()
+        else:
+            loss.backward()
+            if grad_clip is not None:
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            opt.step()
+        if ema is not None:
+            ema.update(model)
         loss_sum += loss.item() * y.size(0)
         pred = logits.argmax(1)
         correct += (pred == y).sum().item()
         total += y.size(0)
     return loss_sum / max(1, total), correct / max(1, total)
 
-
 @torch.no_grad()
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, tta: int = 0):
+    """
+    If tta > 0, apply time-roll TTA: [-2%, 0, +2%] for 3; add ±4% when >=5.
+    """
     model.eval()
     total, correct, loss_sum = 0, 0, 0.0
     all_y, all_p = [], []
+
+    def shifts_for_T(T: int, n: int):
+        if n <= 1:
+            return [0]
+        fracs = [0.0, -0.02, 0.02] if n <= 3 else [0.0, -0.02, 0.02, -0.04, 0.04]
+        return [int(f * T) for f in fracs]
+
     for mel, tab, y in loader:
         mel, tab, y = mel.to(device), tab.to(device), y.to(device)
-        logits = model(mel, tab)
+        if tta <= 1:
+            logits = model(mel, tab)
+        else:
+            T = mel.shape[-1]
+            outs = []
+            for s in shifts_for_T(T, tta):
+                m = mel if s == 0 else torch.roll(mel, shifts=s, dims=-1)
+                outs.append(model(m, tab))
+            logits = torch.stack(outs, dim=0).mean(0)
+
         loss = F.cross_entropy(logits, y)
         loss_sum += loss.item() * y.size(0)
         pred = logits.argmax(1)
         correct += (pred == y).sum().item()
         total += y.size(0)
-        all_y.append(y.cpu().numpy())
-        all_p.append(pred.cpu().numpy())
+        all_y.append(y.detach().cpu().numpy())
+        all_p.append(pred.detach().cpu().numpy())
+
     y_true = np.concatenate(all_y) if all_y else np.array([])
     y_pred = np.concatenate(all_p) if all_p else np.array([])
     return loss_sum / max(1, total), correct / max(1, total), y_true, y_pred
@@ -355,7 +443,6 @@ def evaluate(model, loader, device):
 # ----------------- Data discovery helpers -----------------
 
 def discover_wavs(root: Path) -> Tuple[List[Path], List[int]]:
-    """FLAT layout: root/<class>/*.wav"""
     filepaths, labels = [], []
     class_to_idx = {c: i for i, c in enumerate(CLASSES)}
     for c in CLASSES:
@@ -364,13 +451,10 @@ def discover_wavs(root: Path) -> Tuple[List[Path], List[int]]:
             labels.append(class_to_idx[c])
     return filepaths, labels
 
-
 def has_split_dirs(root: Path) -> bool:
     return (root / "train").is_dir() and (root / "val").is_dir()
 
-
 def discover_split(root: Path) -> Dict[str, Tuple[List[Path], List[int]]]:
-    """SPLIT layout under root/train, root/val, (optional) root/test"""
     out: Dict[str, Tuple[List[Path], List[int]]] = {}
     for subset in ["train", "val", "test"]:
         subdir = root / subset
@@ -378,7 +462,6 @@ def discover_split(root: Path) -> Dict[str, Tuple[List[Path], List[int]]]:
             paths, labels = discover_wavs(subdir)
             out[subset] = (paths, labels)
     return out
-
 
 def preflight_print(root: Path, layout_note: str, sets: Dict[str, Tuple[List[Path], List[int]]]) -> None:
     print(f"\n[Preflight] data_root = {root.resolve()}")
@@ -403,6 +486,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--ft_lr_mult", type=float, default=0.1,
+                        help="Fine-tune LR = lr * ft_lr_mult")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--spec_sr", type=int, default=16000)
     parser.add_argument("--time_crop", type=float, default=5.0)
@@ -410,29 +495,47 @@ def main():
     parser.add_argument("--test_size", type=float, default=0.15)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--no_pretrained", action="store_true",
-                        help="Disable ImageNet pretrained weights for ResNet (faster start, slightly worse).")
+                        help="Disable ImageNet pretrained weights for ResNet.")
+    parser.add_argument("--n_mels", type=int, default=128,
+                        help="Mel bins (e.g., 160).")
+    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--grad_clip", type=float, default=5.0)
 
     # Output path
     parser.add_argument("--out", type=Path, default=Path("fusion_model.pt"),
-                        help="Where to save final best model.")
+                        help="Where to save final best model (EMA state_dict).")
 
     # Regularization / tricks
-    parser.add_argument("--label_smoothing", type=float, default=0.05,
-                        help="Cross-entropy label smoothing (train only). Use 0.0 to disable.")
+    parser.add_argument("--label_smoothing", type=float, default=0.05)
     parser.add_argument("--specaugment", action="store_true",
-                        help="Apply SpecAugment to mel spectrograms (TRAIN only, CNN branch only).")
+                        help="Apply SpecAugment to mel spectrograms (TRAIN only, CNN branch).")
     parser.add_argument("--sa_time_masks", type=int, default=2)
-    parser.add_argument("--sa_time_width", type=int, default=30,
-                        help="Max time-mask width in frames (e.g., 20–40).")
+    parser.add_argument("--sa_time_width", type=int, default=30)
     parser.add_argument("--sa_freq_masks", type=int, default=2)
-    parser.add_argument("--sa_freq_width", type=int, default=12,
-                        help="Max freq-mask width in mel bins (e.g., 8–16).")
-    parser.add_argument("--sa_p", type=float, default=0.7,
-                        help="Probability of applying SpecAugment to a training sample.")
+    parser.add_argument("--sa_freq_width", type=int, default=12)
+    parser.add_argument("--sa_p", type=float, default=0.7)
     parser.add_argument("--ft_disable_sa", action="store_true",
                         help="Turn off SpecAugment during fine-tuning.")
+    parser.add_argument("--shift_prob", type=float, default=0.5,
+                        help="Waveform time-shift prob (train datasets).")
+    parser.add_argument("--shift_max_sec", type=float, default=0.25,
+                        help="Max absolute shift seconds.")
+    parser.add_argument("--ema_decay", type=float, default=0.999)
+
+    # TTA controls (separate for val vs test)
+    parser.add_argument("--tta", type=int, default=None,
+                        help="If set, overrides both --tta_val and --tta_test.")
+    parser.add_argument("--tta_val", type=int, default=1,
+                        help="TTA during validation.")
+    parser.add_argument("--tta_test", type=int, default=3,
+                        help="TTA during final test.")
+
+    parser.add_argument("--balanced_sampler", action="store_true",
+                        help="Use class-balanced WeightedRandomSampler for training loaders.")
 
     args = parser.parse_args()
+    if args.tta is not None:
+        args.tta_val = args.tta_test = args.tta
 
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -451,7 +554,6 @@ def main():
         if "test" in splits:
             X_test, y_test = np.array(splits["test"][0]), np.array(splits["test"][1])
         else:
-            # Create a test split from TRAIN only, keep provided VAL intact
             sss_t = StratifiedShuffleSplit(n_splits=1, test_size=args.test_size, random_state=args.seed)
             tr_keep_idx, test_idx = next(sss_t.split(X_tr, y_tr))
             X_test, y_test = X_tr[test_idx], y_tr[test_idx]
@@ -460,11 +562,9 @@ def main():
                                         "val": (list(X_val), list(y_val)),
                                         "test": (list(X_test), list(y_test))})
     else:
-        # FLAT layout: auto split 70/15/15
         filepaths, labels = discover_wavs(root)
         if not filepaths:
-            raise FileNotFoundError(f"No wav files found under {root}/<class>/*.wav "
-                                    f"(or provide split layout at {root}/train & {root}/val)")
+            raise FileNotFoundError(f"No wav files found under {root}/<class>/*.wav")
         filepaths = np.array(filepaths)
         labels = np.array(labels)
 
@@ -480,7 +580,8 @@ def main():
                                        "val": (list(X_val), list(y_val)),
                                        "test": (list(X_test), list(y_test))})
 
-    cfg = SpecConfig(sr=args.spec_sr)
+    # Config
+    cfg = SpecConfig(sr=args.spec_sr, n_mels=args.n_mels)
 
     # Probe tab dim
     ds_probe = FusionDataset([X_tr[0]], [int(y_tr[0])], cfg=cfg, time_crop=args.time_crop)
@@ -492,28 +593,45 @@ def main():
     g.manual_seed(args.seed)
     pin = torch.cuda.is_available()
 
-    # ---- Datasets / Loaders
-    # Warm-up (SA according to --specaugment)
+    # ---- Datasets
     train_ds_warm = FusionDataset(list(X_tr), list(map(int, y_tr)), cfg=cfg, time_crop=args.time_crop,
                                   specaugment=args.specaugment,
                                   sa_time_w=args.sa_time_width, sa_time_m=args.sa_time_masks,
                                   sa_freq_w=args.sa_freq_width, sa_freq_m=args.sa_freq_masks,
-                                  sa_p=args.sa_p)
+                                  sa_p=args.sa_p,
+                                  enable_shift=(args.shift_prob > 0.0), shift_prob=args.shift_prob, shift_max_sec=args.shift_max_sec)
 
-    # Fine-tune (optionally disable SA)
     train_ds_ft = FusionDataset(list(X_tr), list(map(int, y_tr)), cfg=cfg, time_crop=args.time_crop,
                                 specaugment=(args.specaugment and not args.ft_disable_sa),
                                 sa_time_w=args.sa_time_width, sa_time_m=args.sa_time_masks,
                                 sa_freq_w=args.sa_freq_width, sa_freq_m=args.sa_freq_masks,
-                                sa_p=args.sa_p)
+                                sa_p=args.sa_p,
+                                enable_shift=(args.shift_prob > 0.0), shift_prob=args.shift_prob, shift_max_sec=args.shift_max_sec)
 
-    val_ds   = FusionDataset(list(X_val), list(map(int, y_val)), cfg=cfg, time_crop=args.time_crop, specaugment=False)
-    test_ds  = FusionDataset(list(X_test), list(map(int, y_test)), cfg=cfg, time_crop=args.time_crop, specaugment=False)
+    val_ds   = FusionDataset(list(X_val), list(map(int, y_val)), cfg=cfg, time_crop=args.time_crop,
+                             specaugment=False, enable_shift=False)
+    test_ds  = FusionDataset(list(X_test), list(map(int, y_test)), cfg=cfg, time_crop=args.time_crop,
+                             specaugment=False, enable_shift=False)
 
-    train_dl_warm = DataLoader(train_ds_warm, batch_size=args.batch_size, shuffle=True,
+    # Optional balanced sampler (for both train loaders)
+    sampler = None
+    if args.balanced_sampler:
+        counts = np.bincount(y_tr, minlength=len(CLASSES)).astype(np.float32)
+        class_w = counts.sum() / (len(CLASSES) * np.maximum(counts, 1.0))
+        sample_w = class_w[y_tr]
+        sampler = WeightedRandomSampler(
+            weights=torch.as_tensor(sample_w, dtype=torch.double),
+            num_samples=len(sample_w),
+            replacement=True
+        )
+
+    # ---- Loaders
+    train_dl_warm = DataLoader(train_ds_warm, batch_size=args.batch_size,
+                               shuffle=(sampler is None), sampler=sampler,
                                num_workers=args.workers, pin_memory=pin,
                                worker_init_fn=seed_worker, generator=g)
-    train_dl_ft   = DataLoader(train_ds_ft,   batch_size=args.batch_size, shuffle=True,
+    train_dl_ft   = DataLoader(train_ds_ft,   batch_size=args.batch_size,
+                               shuffle=(sampler is None), sampler=sampler,
                                num_workers=args.workers, pin_memory=pin,
                                worker_init_fn=seed_worker, generator=g)
     val_dl        = DataLoader(val_ds,        batch_size=args.batch_size, shuffle=False,
@@ -523,19 +641,26 @@ def main():
                                num_workers=args.workers, pin_memory=pin,
                                worker_init_fn=seed_worker, generator=g)
 
+    # ---- Model
     model = FusionModel(tab_dim=tab_dim, num_classes=len(CLASSES),
-                        pretrained=not args.no_pretrained).to(device)
+                        pretrained=not args.no_pretrained, p=args.dropout).to(device)
 
-    # Warmup (freeze CNN)
+    # EMA + AMP
+    ema = ModelEMA(model, decay=args.ema_decay)
+    use_amp = torch.cuda.is_available()
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+
+    # ---- Warmup (freeze CNN) + keep BN in eval
     for p in model.img.backbone.parameters():
         p.requires_grad = False
+    model.img.backbone.eval()
 
     opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
                             lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
     best_val_acc, best_state = -1.0, None
-    patience, bad = 7, 0
+    patience, bad = 10, 0
 
     print(f"Classes: {CLASSES}")
     print(f"Train/Val/Test sizes: {len(train_ds_warm)} / {len(val_ds)} / {len(test_ds)}")
@@ -543,9 +668,14 @@ def main():
     # ---- Warm-up
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
-        tr_loss, tr_acc = train_one_epoch(model, train_dl_warm, opt, device,
-                                          label_smoothing=args.label_smoothing)
-        val_loss, val_acc, _, _ = evaluate(model, val_dl, device)
+        tr_loss, tr_acc = train_one_epoch(
+            model, train_dl_warm, opt, device,
+            label_smoothing=args.label_smoothing,
+            ema=ema, scaler=scaler, grad_clip=args.grad_clip,
+            freeze_backbone_bn=True
+        )
+        # IMPORTANT: validate live model (not EMA) during warm-up
+        val_loss, val_acc, _, _ = evaluate(model, val_dl, device, tta=args.tta_val)
         dt = time.time() - t0
         scheduler.step()
         spb = dt / max(1, len(train_dl_warm))
@@ -561,21 +691,30 @@ def main():
             print("Early stopping (warmup).")
             break
 
-    # ---- Fine-tune (unfreeze all)
+    # ---- Fine-tune (unfreeze all) + re-enable BN updates
     if best_state is not None:
-        model.load_state_dict(best_state)
+        model.load_state_dict(best_state, strict=True)
+        ema.ema.load_state_dict(best_state, strict=True)
+
     for p in model.parameters():
         p.requires_grad = True
+    model.img.backbone.train()
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr * 0.1, weight_decay=1e-4)
+    ft_lr = max(1e-6, args.lr * args.ft_lr_mult)
+    opt = torch.optim.AdamW(model.parameters(), lr=ft_lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
     best_val_acc, best_state, bad = -1.0, None, 0
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
-        tr_loss, tr_acc = train_one_epoch(model, train_dl_ft, opt, device,
-                                          label_smoothing=args.label_smoothing)
-        val_loss, val_acc, _, _ = evaluate(model, val_dl, device)
+        tr_loss, tr_acc = train_one_epoch(
+            model, train_dl_ft, opt, device,
+            label_smoothing=args.label_smoothing,
+            ema=ema, scaler=scaler, grad_clip=args.grad_clip,
+            freeze_backbone_bn=False
+        )
+        # In FT it’s fine (and often slightly better) to validate EMA
+        val_loss, val_acc, _, _ = evaluate(ema.ema, val_dl, device, tta=args.tta_val)
         dt = time.time() - t0
         scheduler.step()
         spb = dt / max(1, len(train_dl_ft))
@@ -583,7 +722,7 @@ def main():
               f"val loss {val_loss:.4f} acc {val_acc:.3f} | epoch_time {dt:.1f}s | sec/batch {spb:.3f}")
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            best_state = {k: v.cpu() for k, v in model.state_dict().items()}
+            best_state = {k: v.cpu() for k, v in ema.ema.state_dict().items()}
             bad = 0
         else:
             bad += 1
@@ -591,17 +730,18 @@ def main():
             print("Early stopping (finetune).")
             break
 
-    # ---- Evaluate on test
+    # ---- Evaluate on test using EMA + TTA
     if best_state is not None:
-        model.load_state_dict(best_state)
-    test_loss, test_acc, y_true, y_pred = evaluate(model.to(device), test_dl, device)
+        ema.ema.load_state_dict(best_state, strict=True)
+
+    test_loss, test_acc, y_true, y_pred = evaluate(ema.ema.to(device), test_dl, device, tta=args.tta_test)
     print(f"Test loss {test_loss:.4f} | Test acc {test_acc:.3f}")
     print(classification_report(y_true, y_pred, target_names=CLASSES, digits=3))
     print("Confusion matrix:")
     print(confusion_matrix(y_true, y_pred))
 
-    torch.save(model.state_dict(), args.out)
-    print(f"Saved weights to {args.out.resolve()}")
+    torch.save(ema.ema.state_dict(), args.out)
+    print(f"Saved EMA weights to {args.out.resolve()}")
 
 
 if __name__ == "__main__":
