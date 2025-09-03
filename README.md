@@ -1,3 +1,12 @@
+# My notes:
+
+Best model so far is the specaugmented nonsmoothed model.
+I think the reason this overall model idea worked well is because we got most of the data from the SpecCNN
+but it did not have absolute amplitudes.
+However, we got absolute amplitudes from the other features we extracted.
+
+
+
 # Drone Acoustics Hackathon
 
 > The Helsing hackathon challenge for machine learning on drone acoustics.

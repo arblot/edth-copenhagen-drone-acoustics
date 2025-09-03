@@ -10,7 +10,6 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-# Reuse code from train_fusion
 from . import train_fusion as TF
 from hs_hackathon_drone_acoustics import CLASSES
 
@@ -43,16 +42,12 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     paths = list_wavs(args)
 
-    # Build a tiny dataset using the same extraction (dummy labels)
     cfg = TF.SpecConfig(sr=args.spec_sr)
-    # If time_crop==0, pass None to use full audio
     time_crop = None if (args.time_crop is not None and args.time_crop <= 0) else args.time_crop
     ds = TF.FusionDataset(paths, [0]*len(paths), cfg=cfg, time_crop=time_crop)
-    # Probe tab dim
     _, tab_probe, _ = ds[0]
     tab_dim = int(tab_probe.numel())
 
-    # Model
     model = TF.FusionModel(tab_dim=tab_dim, num_classes=len(CLASSES)).to(device)
     state = torch.load(args.weights, map_location="cpu")
     model.load_state_dict(state)
@@ -69,7 +64,6 @@ def main():
             results.append(probs)
     probs_all = np.concatenate(results, axis=0)
 
-    # Print pretty output for each file
     for i, p in enumerate(paths):
         pr = probs_all[i]
         topk = min(args.topk, len(CLASSES))
