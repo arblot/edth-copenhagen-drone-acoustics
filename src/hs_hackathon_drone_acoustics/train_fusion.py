@@ -1,15 +1,7 @@
 #!/usr/bin/env python3
-"""
-Train a fusion classifier for 3-class audio using:
-- Spectrogram CNN branch (log-mel dBFS, absolute scale preserved)
-- Tabular MLP branch (engineered features + MFCC stats)
-- Split-aware data loading (pre-existing split or auto 70/15/15)
-- (Optional) SpecAugment on mel (TRAIN ONLY, CNN branch only)
-- Waveform time-shift (TRAIN ONLY), label smoothing, EMA, AMP
-- Early stopping, gradient clipping, balanced sampler (optional)
-- Separate TTA for val vs test
 
-Usage (example):
+"""
+(example):
   python -m hs_hackathon_drone_acoustics.train_fusion ^
     --data_root "C:\\Users\\you\\drone_acoustics_train_val_data" ^
     --epochs 20 --batch_size 8 ^
@@ -73,7 +65,7 @@ class SpecConfig:
     hop: int = 256
     n_mels: int = 128
     fmin: int = 20
-    fmax: int | None = None   # None -> sr/2
+    fmax: int | None = None
 
 def logmel_dbfs(y: np.ndarray, cfg: SpecConfig) -> np.ndarray:
     """
@@ -84,7 +76,7 @@ def logmel_dbfs(y: np.ndarray, cfg: SpecConfig) -> np.ndarray:
     M = librosa.feature.melspectrogram(
         S=S, sr=cfg.sr, n_mels=cfg.n_mels, fmin=cfg.fmin, fmax=cfg.fmax
     )
-    M_db = librosa.power_to_db(M, ref=1.0)  # absolute dBFS
+    M_db = librosa.power_to_db(M, ref=1.0)
     return M_db.astype(np.float32)
 
 def mfcc_stats_from_logmel_db(M_db: np.ndarray, n_mfcc: int = 20) -> np.ndarray:
@@ -92,7 +84,7 @@ def mfcc_stats_from_logmel_db(M_db: np.ndarray, n_mfcc: int = 20) -> np.ndarray:
     MFCC (incl. c0) + deltas, then per-coeff stats (mean/std/p10/p90).
     Shape: 20*4*3 = 240
     """
-    mfcc = librosa.feature.mfcc(S=M_db, n_mfcc=n_mfcc)            # (n_mfcc, T)
+    mfcc = librosa.feature.mfcc(S=M_db, n_mfcc=n_mfcc)
     d1 = librosa.feature.delta(mfcc, order=1)
     d2 = librosa.feature.delta(mfcc, order=2)
 
@@ -174,22 +166,19 @@ class FusionDataset(Dataset):
                  sa_time_w: int = 30, sa_time_m: int = 2,
                  sa_freq_w: int = 12, sa_freq_m: int = 2,
                  sa_p: float = 1.0,
-                 # waveform time-shift (enable on TRAIN datasets)
                  enable_shift: bool = False,
                  shift_prob: float = 0.5,
                  shift_max_sec: float = 0.25):
         self.filepaths = filepaths
         self.labels = labels
         self.cfg = cfg
-        self.time_crop = time_crop  # seconds
+        self.time_crop = time_crop
 
-        # SpecAugment controls
         self.use_sa = specaugment
         self.sa_time_w, self.sa_time_m = sa_time_w, sa_time_m
         self.sa_freq_w, self.sa_freq_m = sa_freq_w, sa_freq_m
         self.sa_p = float(sa_p)
 
-        # Waveform time shift (train datasets)
         self.enable_shift = bool(enable_shift)
         self.shift_prob = float(shift_prob)
         self.shift_max_sec = float(shift_max_sec)
@@ -202,21 +191,18 @@ class FusionDataset(Dataset):
         y = wf.data.numpy().astype(np.float32)
         sr_in = int(wf.sample_rate)
 
-        # Mono
         if y.ndim > 1:
             if y.shape[0] < y.shape[-1]:
                 y = np.mean(y, axis=1).astype(np.float32)
             else:
                 y = np.mean(y, axis=0).astype(np.float32)
 
-        # Resample (preserve scale)
         if sr_in != self.cfg.sr:
             y = librosa.resample(y, orig_sr=sr_in, target_sr=self.cfg.sr, res_type="kaiser_best")
             sr = self.cfg.sr
         else:
             sr = sr_in
 
-        # Optional time shift (train datasets only)
         if self.enable_shift and (np.random.rand() < self.shift_prob):
             max_shift = int(self.shift_max_sec * sr)
             if max_shift > 0:
@@ -228,7 +214,6 @@ class FusionDataset(Dataset):
                     else:
                         y[k:] = 0.0
 
-        # Center crop/pad to fixed seconds
         if self.time_crop is not None and self.time_crop > 0:
             L = int(self.time_crop * sr)
             if y.shape[0] >= L:
@@ -245,21 +230,18 @@ class FusionDataset(Dataset):
         label = self.labels[idx]
         y, sr = self._load_and_preprocess(path)
 
-        # Base mel (clean)
         M_base = logmel_dbfs(y, self.cfg)
 
-        # CNN mel (maybe augmented)
         M_cnn = M_base
         if self.use_sa and (np.random.rand() < self.sa_p):
             M_cnn = specaugment(M_base,
                                 time_w=self.sa_time_w, time_m=self.sa_time_m,
                                 freq_w=self.sa_freq_w, freq_m=self.sa_freq_m)
 
-        mel_tensor = torch.from_numpy(M_cnn).unsqueeze(0)  # (1, n_mels, T)
+        mel_tensor = torch.from_numpy(M_cnn).unsqueeze(0)
 
-        # Tabular from clean mel + waveform
-        mfcc_vec = mfcc_stats_from_logmel_db(M_base, n_mfcc=20)   # 240
-        eng_vec  = engineered_features(y, sr)                      # ~19
+        mfcc_vec = mfcc_stats_from_logmel_db(M_base, n_mfcc=20)
+        eng_vec  = engineered_features(y, sr)                      # like 19
         tab_vec  = np.concatenate([eng_vec, mfcc_vec], axis=0).astype(np.float32)
         tab_tensor = torch.from_numpy(tab_vec)
 
@@ -370,7 +352,6 @@ def train_one_epoch(model, loader, opt, device, label_smoothing=0.0,
                     freeze_backbone_bn: bool = False):
     model.train()
     if freeze_backbone_bn:
-        # Keep BN layers of the CNN backbone in eval() even while training
         model.img.backbone.apply(_set_bn_eval)
 
     total, correct, loss_sum = 0, 0, 0.0
@@ -501,11 +482,9 @@ def main():
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--grad_clip", type=float, default=5.0)
 
-    # Output path
     parser.add_argument("--out", type=Path, default=Path("fusion_model.pt"),
                         help="Where to save final best model (EMA state_dict).")
 
-    # Regularization / tricks
     parser.add_argument("--label_smoothing", type=float, default=0.05)
     parser.add_argument("--specaugment", action="store_true",
                         help="Apply SpecAugment to mel spectrograms (TRAIN only, CNN branch).")
@@ -522,7 +501,6 @@ def main():
                         help="Max absolute shift seconds.")
     parser.add_argument("--ema_decay", type=float, default=0.999)
 
-    # TTA controls (separate for val vs test)
     parser.add_argument("--tta", type=int, default=None,
                         help="If set, overrides both --tta_val and --tta_test.")
     parser.add_argument("--tta_val", type=int, default=1,
@@ -580,15 +558,12 @@ def main():
                                        "val": (list(X_val), list(y_val)),
                                        "test": (list(X_test), list(y_test))})
 
-    # Config
     cfg = SpecConfig(sr=args.spec_sr, n_mels=args.n_mels)
 
-    # Probe tab dim
     ds_probe = FusionDataset([X_tr[0]], [int(y_tr[0])], cfg=cfg, time_crop=args.time_crop)
     _, tab_probe, _ = ds_probe[0]
     tab_dim = int(tab_probe.numel())
 
-    # Seeded generator for workers
     g = torch.Generator()
     g.manual_seed(args.seed)
     pin = torch.cuda.is_available()
@@ -613,7 +588,6 @@ def main():
     test_ds  = FusionDataset(list(X_test), list(map(int, y_test)), cfg=cfg, time_crop=args.time_crop,
                              specaugment=False, enable_shift=False)
 
-    # Optional balanced sampler (for both train loaders)
     sampler = None
     if args.balanced_sampler:
         counts = np.bincount(y_tr, minlength=len(CLASSES)).astype(np.float32)
@@ -645,12 +619,11 @@ def main():
     model = FusionModel(tab_dim=tab_dim, num_classes=len(CLASSES),
                         pretrained=not args.no_pretrained, p=args.dropout).to(device)
 
-    # EMA + AMP
     ema = ModelEMA(model, decay=args.ema_decay)
     use_amp = torch.cuda.is_available()
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
-    # ---- Warmup (freeze CNN) + keep BN in eval
+    # ---- Warmup (freeze CNN) + keep BN in eval to stop catastrophic thingy
     for p in model.img.backbone.parameters():
         p.requires_grad = False
     model.img.backbone.eval()
@@ -674,7 +647,7 @@ def main():
             ema=ema, scaler=scaler, grad_clip=args.grad_clip,
             freeze_backbone_bn=True
         )
-        # IMPORTANT: validate live model (not EMA) during warm-up
+
         val_loss, val_acc, _, _ = evaluate(model, val_dl, device, tta=args.tta_val)
         dt = time.time() - t0
         scheduler.step()
@@ -713,7 +686,6 @@ def main():
             ema=ema, scaler=scaler, grad_clip=args.grad_clip,
             freeze_backbone_bn=False
         )
-        # In FT it’s fine (and often slightly better) to validate EMA
         val_loss, val_acc, _, _ = evaluate(ema.ema, val_dl, device, tta=args.tta_val)
         dt = time.time() - t0
         scheduler.step()

@@ -25,13 +25,11 @@ def main():
     TF.set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Detect layout
     if TF.has_split_dirs(args.data_root):
         splits = TF.discover_split(args.data_root)
         if "test" in splits:
             X_test, y_test = np.array(splits["test"][0]), np.array(splits["test"][1])
         else:
-            # carve test from train
             X_tr, y_tr = np.array(splits["train"][0]), np.array(splits["train"][1])
             sss = StratifiedShuffleSplit(n_splits=1, test_size=args.test_size, random_state=args.seed)
             _, test_idx = next(sss.split(X_tr, y_tr))
@@ -48,7 +46,6 @@ def main():
     test_ds = TF.FusionDataset(list(X_test), list(map(int, y_test)), cfg=cfg, time_crop=args.time_crop)
     test_dl = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-    # Build model and load weights (infer tab dim from the first available subset)
     probe_paths = None
     if TF.has_split_dirs(args.data_root):
         splits = TF.discover_split(args.data_root)
